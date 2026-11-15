@@ -625,6 +625,80 @@ void EditView::UpdateBidiData(const EditModel &model, const ViewStyle &vstyle, L
 	}
 }
 
+namespace {
+
+// The width to lay out a screen line in. In right-to-left mode, the platform
+// aligns the line to the right of this width, so it has to end at the right
+// of the text area: textRight is in the same coordinates as xStart, which
+// positions in the layout are relative to.
+XYPOSITION ScreenLineWidth(const EditModel &model, XYPOSITION textRight, XYPOSITION xStart) noexcept {
+	return model.BidirectionalR2L() ? textRight - xStart : textRight;
+}
+
+struct PlacedSegment {
+	TextSegment ts;
+	PRectangle rc;
+};
+
+// Where to draw the segments of a screen line that bf breaks it into. Without
+// a layout, at their positions in ll. With the layout of a right-to-left line,
+// where the layout places them: each segment is split into the parts that it
+// places as a single run, as the parts can be apart or in the opposite order.
+std::vector<PlacedSegment> PlaceSegments(BreakFinder &bf, const LineLayout *ll, Range lineRange,
+	PRectangle rcLine, int xStart, IScreenLineLayout *layout) {
+	const XYPOSITION subLineStart = static_cast<XYPOSITION>(ll->positions[lineRange.start]);
+	const auto nextCharacter = [ll](int position) noexcept {
+		return position + UTF8DrawBytes(reinterpret_cast<const unsigned char *>(&ll->chars[position]),
+			ll->numCharsInLine - position);
+	};
+	const auto intervalsOf = [layout, lineRange](int start, int end) {
+		return layout->FindRangeIntervals(static_cast<size_t>(start - lineRange.start),
+			static_cast<size_t>(end - lineRange.start));
+	};
+
+	std::vector<PlacedSegment> placed;
+	while (bf.More()) {
+		const TextSegment ts = bf.Next();
+		PRectangle rc = rcLine;
+		if (!layout) {
+			rc.left = ll->positions[ts.start] + xStart - subLineStart;
+			rc.right = ll->positions[ts.end()] + xStart - subLineStart;
+			placed.push_back({ts, rc});
+			continue;
+		}
+
+		// ponytail: grows each run one character at a time, so quadratic in the
+		// length of a segment; BreakFinder keeps segments short.
+		for (int start = ts.start; start < ts.end();) {
+			int end = nextCharacter(start);
+			std::vector<Interval> intervals = intervalsOf(start, end);
+			while (end < ts.end()) {
+				const int next = nextCharacter(end);
+				std::vector<Interval> grown = intervalsOf(start, next);
+				if (grown.size() != 1)
+					break;
+				intervals = std::move(grown);
+				end = next;
+			}
+			if (!intervals.empty()) {
+				rc.left = intervals.front().left;
+				rc.right = intervals.front().right;
+				for (const Interval &interval : intervals) {
+					rc.left = std::min(rc.left, interval.left);
+					rc.right = std::max(rc.right, interval.right);
+				}
+				rc.left += xStart;
+				rc.right += xStart;
+				placed.push_back({TextSegment(start, end - start, ts.representation), rc});
+			}
+			start = end;
+		}
+	}
+	return placed;
+}
+
+}
+
 Point EditView::LocationFromPosition(Surface *surface, const EditModel &model, SelectionPosition pos, Sci::Line topLine,
 				     const ViewStyle &vs, PointEnd pe, const PRectangle rcClient) {
 	Point pt;
@@ -654,7 +728,9 @@ Point EditView::LocationFromPosition(Surface *surface, const EditModel &model, S
 			const int caretPosition = posInLine - ll->LineStart(subLine);
 
 			// Get the point from current position
-			const ScreenLine screenLine(ll, subLine, vs, rcClient.right, tabWidthMinimumPixels);
+			const ScreenLine screenLine(ll, subLine, vs,
+				ScreenLineWidth(model, rcClient.right - vs.rightMarginWidth, vs.textStart - model.xOffset),
+				tabWidthMinimumPixels);
 			std::unique_ptr<IScreenLineLayout> slLayout = surface->Layout(&screenLine);
 			pt.x = slLayout->XFromPosition(caretPosition);
 
@@ -724,7 +800,9 @@ SelectionPosition EditView::SPositionFromLocation(Surface *surface, const EditMo
 				// Fill the line bidi data
 				UpdateBidiData(model, vs, ll);
 
-				const ScreenLine screenLine(ll, subLine, vs, rcClient.right, tabWidthMinimumPixels);
+				const ScreenLine screenLine(ll, subLine, vs,
+					ScreenLineWidth(model, rcClient.right - vs.rightMarginWidth, vs.textStart - model.xOffset),
+					tabWidthMinimumPixels);
 				std::unique_ptr<IScreenLineLayout> slLayout = surface->Layout(&screenLine);
 				positionInLine = slLayout->PositionFromX(static_cast<XYPOSITION>(pt.x), charPosition) +
 					rangeSubLine.start;
@@ -1041,10 +1119,16 @@ void EditView::DrawEOL(Surface *surface, const EditModel &model, const ViewStyle
 		}
 	}
 
-	rcSegment.left = rcSegment.right;
-	if (rcSegment.left < rcLine.left)
+	if (model.BidirectionalR2L()) {
+		// A right-to-left line is aligned to the right, so the rest is on the left
 		rcSegment.left = rcLine.left;
-	rcSegment.right = rcLine.right;
+		rcSegment.right = std::max(rcLine.left, rcLine.right - (xEol + virtualSpace + blobsWidth));
+	} else {
+		rcSegment.left = rcSegment.right;
+		if (rcSegment.left < rcLine.left)
+			rcSegment.left = rcLine.left;
+		rcSegment.right = rcLine.right;
+	}
 
 	const bool drawEOLAnnotationStyledText = (vsDraw.eolAnnotationVisible != EOLANNOTATION_HIDDEN) && model.pdoc->EOLAnnotationStyledText(line).text;
 	const bool fillRemainder = (!lastSubLine || (!model.GetFoldDisplayText(line) && !drawEOLAnnotationStyledText));
@@ -1523,8 +1607,10 @@ void EditView::DrawCarets(Surface *surface, const EditModel &model, const ViewSt
 		if (ll->InLine(offset, subLine) && offset <= ll->numCharsBeforeEOL) {
 			XYPOSITION xposCaret = ll->positions[offset] + virtualOffset - ll->positions[ll->LineStart(subLine)];
 			if (model.BidirectionalEnabled() && (posCaret.VirtualSpace() == 0)) {
-				// Get caret point
-				const ScreenLine screenLine(ll, subLine, vsDraw, rcLine.right, tabWidthMinimumPixels);
+				// Get caret point, which is offset by the wrap indent below
+				const XYPOSITION wrapOffset = (ll->wrapIndent != 0 && ll->LineStart(subLine) != 0) ? ll->wrapIndent : 0;
+				const ScreenLine screenLine(ll, subLine, vsDraw,
+					ScreenLineWidth(model, rcLine.right - wrapOffset, xStart), tabWidthMinimumPixels);
 
 				const int caretPosition = offset - ll->LineStart(subLine);
 
@@ -1651,16 +1737,23 @@ void EditView::DrawBackground(Surface *surface, const EditModel &model, const Vi
 
 	const bool drawWhitespaceBackground = vsDraw.WhitespaceBackgroundDrawn() && !background.isSet;
 
-	// Background drawing loop
-	while (bfBack.More()) {
+	// A right-to-left line is aligned to the right, so what its text doesn't
+	// cover is on the left: fill all of the line first.
+	const ScreenLine screenLine(ll, subLine, vsDraw, ScreenLineWidth(model, rcLine.right, xStart), tabWidthMinimumPixels);
+	std::unique_ptr<IScreenLineLayout> layout;
+	if (model.BidirectionalR2L()) {
+		layout = surface->Layout(&screenLine);
+		surface->FillRectangle(rcLine, background.isSet ? background : vsDraw.styles[STYLE_DEFAULT].back);
+	}
 
-		const TextSegment ts = bfBack.Next();
+	// Background drawing loop
+	for (const PlacedSegment &placed : PlaceSegments(bfBack, ll, lineRange, rcLine, xStart, layout.get())) {
+
+		const TextSegment &ts = placed.ts;
 		const Sci::Position i = ts.end() - 1;
 		const Sci::Position iDoc = i + posLineStart;
 
-		PRectangle rcSegment = rcLine;
-		rcSegment.left = ll->positions[ts.start] + xStart - static_cast<XYPOSITION>(subLineStart);
-		rcSegment.right = ll->positions[ts.end()] + xStart - static_cast<XYPOSITION>(subLineStart);
+		PRectangle rcSegment = placed.rc;
 		// Only try to draw if really visible - enhances performance by not calling environment to
 		// draw strings that are completely past the right side of the window.
 		if (!rcSegment.Empty() && rcSegment.Intersects(rcLine)) {
@@ -1704,7 +1797,8 @@ void EditView::DrawBackground(Surface *surface, const EditModel &model, const Vi
 					}
 				}
 			}
-		} else if (rcSegment.left > rcLine.right) {
+		} else if (!layout && rcSegment.left > rcLine.right) {
+			// Segments placed by a layout are not in the order they are drawn in
 			break;
 		}
 	}
@@ -1775,7 +1869,8 @@ static void DrawTranslucentSelection(Surface *surface, const EditModel &model, c
 
 						const ColourDesired background = SelectionBackground(vsDraw, r == model.sel.Main(), model.primarySelection);
 
-						const ScreenLine screenLine(ll, subLine, vsDraw, rcLine.right, tabWidthMinimumPixels);
+						const ScreenLine screenLine(ll, subLine, vsDraw,
+							ScreenLineWidth(model, rcLine.right, xStart), tabWidthMinimumPixels);
 						std::unique_ptr<IScreenLineLayout> slLayout = surface->Layout(&screenLine);
 
 						const std::vector<Interval> intervals = slLayout->FindRangeIntervals(selectionStart, selectionEnd);
@@ -1867,15 +1962,18 @@ void EditView::DrawForeground(Surface *surface, const EditModel &model, const Vi
 	BreakFinder bfFore(ll, &model.sel, lineRange, posLineStart, xStartVisible,
 		(((phasesDraw == phasesOne) && selBackDrawn) || vsDraw.selColours.fore.isSet), model.pdoc, &model.reprs, &vsDraw);
 
-	while (bfFore.More()) {
+	const ScreenLine screenLine(ll, subLine, vsDraw, ScreenLineWidth(model, rcLine.right, xStart), tabWidthMinimumPixels);
+	std::unique_ptr<IScreenLineLayout> layout;
+	if (model.BidirectionalR2L())
+		layout = surface->Layout(&screenLine);
 
-		const TextSegment ts = bfFore.Next();
+	for (const PlacedSegment &placed : PlaceSegments(bfFore, ll, lineRange, rcLine, xStart, layout.get())) {
+
+		const TextSegment &ts = placed.ts;
 		const Sci::Position i = ts.end() - 1;
 		const Sci::Position iDoc = i + posLineStart;
 
-		PRectangle rcSegment = rcLine;
-		rcSegment.left = ll->positions[ts.start] + xStart - static_cast<XYPOSITION>(subLineStart);
-		rcSegment.right = ll->positions[ts.end()] + xStart - static_cast<XYPOSITION>(subLineStart);
+		PRectangle rcSegment = placed.rc;
 		// Only try to draw if really visible - enhances performance by not calling environment to
 		// draw strings that are completely past the right side of the window.
 		if (rcSegment.Intersects(rcLine)) {
@@ -2040,7 +2138,8 @@ void EditView::DrawForeground(Surface *surface, const EditModel &model, const Vi
 				rcUL.bottom = rcUL.top + 1;
 				surface->FillRectangle(rcUL, textFore);
 			}
-		} else if (rcSegment.left > rcLine.right) {
+		} else if (!layout && rcSegment.left > rcLine.right) {
+			// Segments placed by a layout are not in the order they are drawn in
 			break;
 		}
 	}
